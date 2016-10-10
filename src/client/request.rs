@@ -10,11 +10,24 @@ use version::HttpVersion;
 
 /// A client request to a remote server.
 #[derive(Debug)]
-pub struct Request<'a> {
-    head: &'a mut RequestHead
+pub struct Request {
+    head: RequestHead,
+    body: Option<()>,
 }
 
-impl<'a> Request<'a> {
+impl Request {
+    #[inline]
+    pub fn new(method: Method, url: Url) -> Request {
+        Request {
+            head: MessageHead {
+                subject: (method, RequestUri::AboluteUri(url)),
+                version: HttpVersion::default(),
+                headers: Headers::new(),
+            },
+            body: None,
+        }
+    }
+
     /// Read the Request Url.
     #[inline]
     pub fn uri(&self) -> &RequestUri { &self.head.subject.1 }

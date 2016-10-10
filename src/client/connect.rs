@@ -4,30 +4,32 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 
-use rotor::mio::tcp::TcpStream;
+use futures::{Future, Poll, Async};
+use tokio::reactor::Handle;
+use tokio::tcp::{TcpStream, TcpStreamNew};
 use url::Url;
 
-use net::{HttpStream, HttpsStream, Transport, SslClient};
-use super::dns::Dns;
+use net::{Transport, HttpStream, /*HttpsStream, SslClient*/};
+use super::dns;
 use super::Registration;
+
+pub type DefaultConnector = HttpConnector;
+#[doc(hidden)]
+pub type DefaultTransport = <DefaultConnector as Connect>::Output;
+
 
 /// A connector creates a Transport to a remote address..
 pub trait Connect {
     /// Type of Transport to create
     type Output: Transport;
+    /// dox
+    type Fut: Future<Item=Self::Output, Error=io::Error>;
     /// The key used to determine if an existing socket can be used.
     type Key: Eq + Hash + Clone + fmt::Debug;
     /// Returns the key based off the Url.
     fn key(&self, &Url) -> Option<Self::Key>;
     /// Connect to a remote address.
-    fn connect(&mut self, &Url) -> io::Result<Self::Key>;
-    /// Returns a connected socket and associated host.
-    fn connected(&mut self) -> Option<(Self::Key, io::Result<Self::Output>)>;
-    #[doc(hidden)]
-    /// Configure number of dns workers to use.
-    fn dns_workers(&mut self, usize);
-    #[doc(hidden)]
-    fn register(&mut self, Registration);
+    fn connect(&mut self, &Url) -> Self::Fut;
 }
 
 type Scheme = String;
@@ -37,7 +39,7 @@ type Port = u16;
 pub struct HttpConnector {
     dns: Option<Dns>,
     threads: usize,
-    resolving: HashMap<String, Vec<(&'static str, String, u16)>>,
+    //resolving: HashMap<String, Vec<(&'static str, String, u16)>>,
 }
 
 impl HttpConnector {
@@ -65,13 +67,13 @@ impl fmt::Debug for HttpConnector {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("HttpConnector")
             .field("threads", &self.threads)
-            .field("resolving", &self.resolving)
             .finish()
     }
 }
 
 impl Connect for HttpConnector {
     type Output = HttpStream;
+    type Fut = Connecting;
     type Key = (&'static str, String, u16);
 
     fn dns_workers(&mut self, count: usize) {
@@ -90,13 +92,14 @@ impl Connect for HttpConnector {
         }
     }
 
-    fn connect(&mut self, url: &Url) -> io::Result<Self::Key> {
+    fn connect(&mut self, url: &Url) -> Self::Fut {
         debug!("Http::connect({:?})", url);
         if let Some(key) = self.key(url) {
             let host = url.host_str().expect("http scheme must have a host");
-            self.dns.as_ref().expect("dns workers lost").resolve(host);
-            self.resolving.entry(host.to_owned()).or_insert_with(Vec::new).push(key.clone());
-            Ok(key)
+
+            Connecting {
+                state: State::Resolving(self.dns.as_ref().expect("dns workers lost").query(host))
+            }
         } else {
             Err(io::Error::new(io::ErrorKind::InvalidInput, "scheme must be http"))
         }
@@ -130,6 +133,77 @@ impl Connect for HttpConnector {
     }
 }
 
+pub struct Connecting {
+    state: State,
+    handle: Handle,
+}
+
+enum State {
+    Resolving(dns::Query),
+    Connecting(ConnectingTcp),
+    Error(Option<io::Error>)
+}
+
+impl Future for Connecting {
+    type Item = HttpStream;
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            let state;
+            match self.state {
+                State::Resolving(ref mut query) => {
+                    match try!(query.poll()) {
+                        Async::NotReady => return Ok(Async::NotReady),
+                        Async::Ready(addrs) => {
+                            state = State::Connecting(ConnectingTcp {
+                                addrs: addrs,
+                                current: None,
+                            })
+                        }
+                    }
+                },
+                State::Connecting(ref mut c) => c.poll(&self.handle),
+                State::Error(err) => return err.take().expect("polled Connecting too many times"),
+            }
+            self.state = state;
+        }
+    }
+}
+
+struct ConnectingTcp {
+    addrs: dns::IpAddrs,
+    current: Option<TcpStreamNew>,
+}
+
+impl ConnectingTcp {
+    // not a Future, since passing a &Handle to poll
+    fn poll(&mut self, handle: &Handle) -> Poll<TcpStream, io::Error> {
+        let mut err = None;
+        loop {
+            if let Some(ref mut current) = self.current {
+                match current.poll() {
+                    Ok(ok) => return Ok(ok),
+                    Err(e) => {
+                        trace!("connect error {:?}", e);
+                        err = Some(e);
+                        if let Some(addr) = self.addrs.next() {
+                            *current = TcpStream::connect(&addr, handle);
+                            continue;
+                        }
+                    }
+                }
+            } else if let Some(addr) = self.addrs.next() {
+                self.current = Some(sock);
+                continue;
+            }
+
+            return Err(err.take().expect("missing connect error"));
+        }
+    }
+}
+
+/*
 /// A connector that can protect HTTP streams using SSL.
 #[derive(Debug, Default)]
 pub struct HttpsConnector<S: SslClient> {
@@ -223,3 +297,4 @@ fn _assert_defaults() {
 
     _assert::<DefaultConnector, DefaultTransport>();
 }
+*/

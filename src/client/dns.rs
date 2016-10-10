@@ -3,16 +3,36 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::thread;
 use std::vec;
 
-use ::spmc;
-
-use http::channel;
+use ::futures::{Future, Poll};
+use ::futures_cpupool::{CpuPool, CpuFuture};
 
 pub struct Dns {
-    tx: spmc::Sender<String>,
-    rx: channel::Receiver<Answer>,
+    pool: CpuPool,
 }
 
-pub type Answer = (String, io::Result<IpAddrs>);
+impl Dns {
+    pub fn new(threads: usize) -> Dns {
+        Dns {
+            pool: CpuPool::new(threads)
+        }
+    }
+
+    pub fn resolve<S: Into<String>>(&self, hostname: S) -> Query {
+        let hostname = hostname.into();
+        Query(self.pool.spawn_fn(move || work(hostname)))
+    }
+}
+
+pub struct Query(CpuFuture<IpAddrs, io::Error>);
+
+impl Future for Query {
+    type Item = Answer;
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        self.0.poll()
+    }
+}
 
 pub struct IpAddrs {
     iter: vec::IntoIter<SocketAddr>,
@@ -26,26 +46,13 @@ impl Iterator for IpAddrs {
     }
 }
 
-impl Dns {
-    pub fn new(notify: (channel::Sender<Answer>, channel::Receiver<Answer>), threads: usize) -> Dns {
-        let (tx, rx) = spmc::channel();
-        for _ in 0..threads {
-            work(rx.clone(), notify.0.clone());
-        }
-        Dns {
-            tx: tx,
-            rx: notify.1,
-        }
-    }
+pub type Answer = io::Result<IpAddrs>;
 
-    pub fn resolve<T: Into<String>>(&self, hostname: T) {
-        self.tx.send(hostname.into()).expect("DNS workers all died unexpectedly");
-    }
-
-    pub fn resolved(&self) -> Result<Answer, channel::TryRecvError> {
-        self.rx.try_recv()
-    }
+fn work(hostname: String) -> Answer {
+    debug!("resolve {:?}", hostname);
+    (&*hostname, 80).to_socket_addrs().map(|i| IpAddrs { iter: i })
 }
+/*
 
 fn work(rx: spmc::Receiver<String>, notify: channel::Sender<Answer>) {
     thread::Builder::new().name(String::from("hyper-dns")).spawn(move || {
@@ -94,3 +101,4 @@ impl Drop for Worker {
         }
     }
 }
+*/
